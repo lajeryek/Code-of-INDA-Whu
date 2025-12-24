@@ -28,15 +28,28 @@ params.Ntot = 200;
 params.Etot = 600;
 params.Pmax = 5;
 
-% Thresholds (your current setting; may saturate Rd near 1)
 params.epsBM_th  = 0.5;
 params.epsBK_th  = 0.5;
 params.epsEM_th  = 0.5;
 params.epsEK_min = 0.5;
 
-% Search controls
-params.max_outer_iter = 20;
-params.outer_tol = 1e-10;
+% Outer iteration controls
+params.max_outer_iter  = 60;
+params.min_outer_iter  = 12;      
+params.stop_patience   = 8;       % 连续多轮无显著提升才停
+params.outer_abs_tol   = 1e-13;   % 绝对提升阈值（更严格）
+params.outer_rel_tol   = 1e-11;   % 相对提升阈值
+
+% Progressive refinement schedules
+params.n_window        = 80;
+params.n_step_schedule = [8 4 2 1];
+
+params.p_levels_per_outer = 1;           % 每轮只做一层功率网格
+params.p_grid_schedule    = [11 15 21 31 41];
+params.p_win0             = params.Pmax; % 初始功率窗口
+params.p_win_decay        = 0.85;        % 每轮缩小一点（慢）
+params.p_win_min          = 0.05*params.Pmax;
+
 
 % n-search
 params.enforce_full_blocklength = true;  % if true: nM+nK=Ntot (recommended)
@@ -78,52 +91,62 @@ end
 
 %% ========================================================================
 function res = pld_joint_opt_grid(params)
-% Outer loop:
-%   Step1: given (P,n) -> optimize integer dK by enumeration
-%   Step2: given (P)   -> optimize integer n by scan (and re-opt dK)
-%   Step3: given (n)   -> optimize (P) by grid refine (and re-opt dK)
-% Keep best feasible; stop when improvement tiny.
 
 % ---------- Feasible initialization ----------
 [PM, PK, nM, nK, dK, Rd, ok] = find_feasible_init(params);
 if ~ok
-    res.feasible = false;
-    return;
+    res.feasible = false; return;
 end
 
-Rd_hist = Rd;
+best = pack_sol(PM, PK, nM, nK, dK, Rd);
+Rd_hist = best.Rd;
 
 fprintf('\n[Init feasible]\n');
-fprintf('  n=[%d,%d], P=[%.3f,%.3f], dK=%d, Rd=%.6f\n', nM,nK,PM,PK,dK,Rd);
+fprintf('  n=[%d,%d], P=[%.3f,%.3f], dK=%d, Rd=%.6f\n', best.nM,best.nK,best.PM,best.PK,best.dK,best.Rd);
 
-best = pack_sol(PM, PK, nM, nK, dK, Rd);
+% progressive states
+p_win = params.p_win0;
+stall = 0;
 
 for it = 1:params.max_outer_iter
     Rd_prev = best.Rd;
 
-    % -------- Step A: optimize n (integer scan) --------
-    % -------- opt_n_scan先dk再PM
-    [cand_n, okn] = opt_n_scan(best.PM, best.PK, best.nM, best.nK, params);
-    if okn && cand_n.Rd > best.Rd + params.tie_tol
-        best = cand_n;
-    elseif okn && abs(cand_n.Rd - best.Rd) <= params.tie_tol
-        best = tie_break(best, cand_n, params);
+    % -------- choose refinement for this outer iter --------
+    n_step = params.n_step_schedule(min(it, numel(params.n_step_schedule)));
+    p_grid = params.p_grid_schedule(min(it, numel(params.p_grid_schedule)));
+
+    % -------- (A) n-update: local + coarse-to-fine --------
+    [cand_n, okn] = opt_n_scan_local(best.PM, best.PK, best.nM, best.nK, n_step, params);
+    if okn
+        best = accept_if_better(best, cand_n, params);
     end
 
-    % -------- Step B: optimize P (coarse-to-fine) --------
-    [cand_p, okp] = opt_p_grid(best.nM, best.nK, best.PM, best.PK, params);
-    if okp && cand_p.Rd > best.Rd + params.tie_tol
-        best = cand_p;
-    elseif okp && abs(cand_p.Rd - best.Rd) <= params.tie_tol
-        best = tie_break(best, cand_p, params);
+    % -------- (B) P-update: one-level grid with progressive p_grid --------
+    [cand_p, okp] = opt_p_grid_onelevel(best.nM, best.nK, best.PM, best.PK, p_win, p_grid, params);
+    if okp
+        best = accept_if_better(best, cand_p, params);
     end
+
+    % update window slowly (so improvements can appear across many iterations)
+    p_win = max(params.p_win_min, p_win * params.p_win_decay);
 
     Rd_hist(end+1) = best.Rd; %#ok<AGROW>
-    fprintf('[Iter %02d] Rd=%.12f | n=[%d,%d] P=[%.3f,%.3f] dK=%d\n', ...
-        it, best.Rd, best.nM, best.nK, best.PM, best.PK, best.dK);
 
-    if abs(best.Rd - Rd_prev) <= params.outer_tol
-        fprintf('Stop: |ΔRd|=%.3e <= %.3e\n', abs(best.Rd - Rd_prev), params.outer_tol);
+    dRd = best.Rd - Rd_prev;
+    fprintf('[Iter %02d] Rd=%.12f | Δ=%.3e | n=[%d,%d] P=[%.4f,%.4f] dK=%d | (nStep=%d, pGrid=%d, pWin=%.3f)\n', ...
+        it, best.Rd, dRd, best.nM, best.nK, best.PM, best.PK, best.dK, n_step, p_grid, p_win);
+
+    % -------- stopping: min iter + patience + abs/rel tol --------
+    tol_eff = max(params.outer_abs_tol, params.outer_rel_tol * max(1, abs(Rd_prev)));
+    if dRd <= tol_eff
+        stall = stall + 1;
+    else
+        stall = 0;
+    end
+
+    if it >= params.min_outer_iter && stall >= params.stop_patience
+        fprintf('Stop: stall=%d >= %d after minIter=%d (tolEff=%.3e)\n', ...
+            stall, params.stop_patience, params.min_outer_iter, tol_eff);
         break;
     end
 end
@@ -132,6 +155,43 @@ res = best;
 res.feasible = true;
 res.Rd_hist = Rd_hist;
 
+end
+
+function best = accept_if_better(best, cand, params)
+if cand.Rd > best.Rd + params.tie_tol
+    best = cand;
+elseif abs(cand.Rd - best.Rd) <= params.tie_tol
+    best = tie_break(best, cand, params);
+end
+end
+
+
+%% ========================================================================
+function [cand, ok] = opt_n_scan_local(PM, PK, nM0, nK0, step, params)
+ok = false; cand = struct();
+best_Rd = -inf; best_sol = [];
+
+N = params.Ntot;
+w = params.n_window;
+
+% local candidates around current nM*
+nM_min = max(params.n_min_int, nM0 - w);
+nM_max = min(N - params.n_min_int, nM0 + w);
+
+for nM = nM_min : step : nM_max
+    nK = N - nM; % enforce full length
+    [dK, Rd, feas] = eval_best_dK_integer(PM, PK, nM, nK, params);
+    if ~feas, continue; end
+
+    s = pack_sol(PM, PK, nM, nK, dK, Rd);
+    if Rd > best_Rd + params.tie_tol
+        best_Rd = Rd; best_sol = s; ok = true;
+    elseif abs(Rd - best_Rd) <= params.tie_tol && ok
+        best_sol = tie_break(best_sol, s, params);
+    end
+end
+
+if ok, cand = best_sol; end
 end
 
 
@@ -182,6 +242,43 @@ end
 
 end
 
+
+
+%% ========================================================================
+function [cand, ok] = opt_p_grid_onelevel(nM, nK, PM0, PK0, win, gridN, params)
+ok = false; cand = struct();
+best_Rd = -inf; best_sol = [];
+
+PM_min = max(0, PM0 - win);
+PM_max = min(params.Pmax, PM0 + win);
+PK_min = max(0, PK0 - win);
+PK_max = min(params.Pmax, PK0 + win);
+
+PM_list = linspace(PM_min, PM_max, gridN);
+PK_list = linspace(PK_min, PK_max, gridN);
+
+for i = 1:numel(PM_list)
+    PM = PM_list(i);
+    for j = 1:numel(PK_list)
+        PK = PK_list(j);
+
+        if ~check_resource(PM, PK, nM, nK, params), continue; end
+
+        [dK, Rd, feas] = eval_best_dK_integer(PM, PK, nM, nK, params);
+        if ~feas, continue; end
+
+        s = pack_sol(PM, PK, nM, nK, dK, Rd);
+
+        if Rd > best_Rd + params.tie_tol
+            best_Rd = Rd; best_sol = s; ok = true;
+        elseif abs(Rd - best_Rd) <= params.tie_tol && ok
+            best_sol = tie_break(best_sol, s, params);
+        end
+    end
+end
+
+if ok, cand = best_sol; end
+end
 
 %% ========================================================================
 function [cand, ok] = opt_p_grid(nM, nK, PM0, PK0, params)
@@ -415,7 +512,7 @@ ok = false;
 PM = NaN; PK = NaN; nM = NaN; nK = NaN; dK = NaN; Rd = NaN;
 
 % splits = linspace(0.3, 0.7, 9);
-splits = linspace(0.1, 0.9, 10);
+splits = linspace(0.1, 0.9, 15);
 best_Rd = -inf;
 
 for s = splits
