@@ -1,5 +1,5 @@
 function main()
-% main.m
+% main.m 
 % PLD joint optimization (OFDM, orthogonal):
 % Variables: P_M, P_K, n_M, n_K, d_K (integer)
 % Goal: maximize R_d
